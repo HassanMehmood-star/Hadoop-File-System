@@ -120,14 +120,5 @@ Cloud-Computing-Pokec-Project/
 Conclusion
 This project demonstrates the application of MapReduce and Hadoop for large-scale data analysis. By processing and analyzing the Pokec Social Network Dataset, I was able to build predictive models and uncover insights into user behaviors and profile completion rates. The project successfully leveraged Hadoop's distributed computing capabilities to handle large datasets and perform complex data analysis tasks efficiently.
 
-Feel free to reach out if you have any questions or feedback!
 
-yaml
-Copy
-
----
-
-### **Updates**:
-- **Project Structure** section added, detailing the organization of the files and folders.
-- **Conclusion** summarizes the key outcomes of the project and its goals.
 
