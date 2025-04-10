@@ -64,7 +64,7 @@ Before running the project, ensure you have the following installed and configur
    Before running the MapReduce job, upload the **Pokec Social Network Dataset** to HDFS:
    ```bash
    hdfs dfs -put pokec_data.csv /user/hadoop/pokec_data
-   ```
+   
 2. Run MapReduce Job:
 Execute the MapReduce job on Hadoop:
 
