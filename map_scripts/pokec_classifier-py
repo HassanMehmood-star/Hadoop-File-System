@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+pokec_classifier.py
+This script demonstrates how to build two classifiers on a large HDFS dataset 
+without loading it entirely into memory. 
+It uses: 
+    - Incremental learning for Linear Regression via SGDRegressor.
+    - A sampling approach for Random Forest training (since it cannot be trained incrementally).
+
+The dataset is read from HDFS in chunks using Pandas’ chunksize parameter.
+
+Usage (standalone or via Hadoop Streaming):
+    python3 pokec_classifier.py --input /user/hadoop/pokec/soc-pokec-profiles.txt
+
+Example Hadoop Streaming command using your dataset:
+    hadoop jar /usr/local/hadoop/share/hadoop/tools/lib/hadoop-streaming-*.jar \
+        -D mapreduce.job.reduces=1 \
+        -D mapreduce.reduce.memory.mb=8192 \
+        -input /user/hadoop/pokec/soc-pokec-profiles.txt \
+        -output /user/hadoop/output_model \
+        -mapper "cat" \
+        -reducer "python3 /path/to/hadoop_project/pokec_classifier.py --input /user/hadoop/pokec/soc-pokec-profiles.txt" \
+        -file /path/to/hadoop_project/pokec_classifier.py
+"""
+
+import sys
+import subprocess
+import argparse
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import SGDRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+
+# Column names per dataset documentation.
+COLUMNS = [
+    "user_id", "public", "completion_percentage", "gender", "region",
+    "last_login", "registration", "AGE", "body", "I_am_working_in_field",
+    "spoken_languages", "hobbies", "I_most_enjoy_good_food", "pets", "body_type",
+    "my_eyesight", "eye_color", "hair_color", "hair_type", "completed_level_of_education",
+    "favourite_color", "relation_to_smoking", "relation_to_alcohol", "sign_in_zodiac",
+    "on_pokec_i_am_looking_for", "love_is_for_me", "relation_to_casual_sex",
+    "my_partner_should_be", "marital_status", "children", "relation_to_children",
+    "I_like_movies", "I_like_watching_movie", "I_like_music", "I_mostly_like_listening_to_music",
+    "the_idea_of_good_evening", "I_like_specialties_from_kitchen", "fun",
+    "I_am_going_to_concerts", "my_active_sports", "my_passive_sports", "profession",
+    "I_like_books", "life_style", "music", "cars", "politics", "relationships",
+    "art_culture", "hobbies_interests", "science_technologies", "computers_internet",
+    "education", "sport", "movies", "travelling", "health", "companies_brands", "more"
+]
+
+# Columns to drop because they are non-predictive or free-text.
+DROP_COLUMNS = [
+    "user_id", "last_login", "registration", "region", "body", "I_am_working_in_field",
+    "spoken_languages", "hobbies", "I_most_enjoy_good_food", "pets", "body_type",
+    "my_eyesight", "eye_color", "hair_color", "hair_type", "completed_level_of_education",
+    "favourite_color", "relation_to_smoking", "relation_to_alcohol", "sign_in_zodiac",
+    "on_pokec_i_am_looking_for", "love_is_for_me", "relation_to_casual_sex",
+    "my_partner_should_be", "marital_status", "children", "relation_to_children",
+    "I_like_movies", "I_like_watching_movie", "I_like_music", "I_mostly_like_listening_to_music",
+    "the_idea_of_good_evening", "I_like_specialties_from_kitchen", "fun",
+    "I_am_going_to_concerts", "my_active_sports", "my_passive_sports", "profession",
+    "I_like_books", "life_style", "music", "cars", "politics", "relationships",
+    "art_culture", "hobbies_interests", "science_technologies", "computers_internet",
+    "education", "sport", "movies", "travelling", "health", "companies_brands", "more"
+]
+
+def drain_stdin():
+    """
+    Drain STDIN (required in Hadoop Streaming if input is not used).
+    """
+    for _ in sys.stdin:
+        pass
+
+def read_data_from_hdfs_chunks(hdfs_path, chunksize=100000):
+    """
+    Reads the HDFS file by opening a pipe to 'hadoop fs -cat' and yields Pandas DataFrame chunks.
+    Uses text mode for proper string decoding.
+    """
+    try:
+        process = subprocess.Popen(["hadoop", "fs", "-cat", hdfs_path],
+                                   stdout=subprocess.PIPE, text=True)
+    except Exception as e:
+        print("Error starting HDFS read process:", e)
+        sys.exit(1)
+    
+    # Read the CSV data in chunks.
+    for chunk in pd.read_csv(process.stdout, sep="\t", header=None,
+                             names=COLUMNS, low_memory=False, chunksize=chunksize):
+        print(f"Read a chunk with shape: {chunk.shape}")  # Debug print
+        # Drop non-predictive columns.
+        chunk.drop(columns=DROP_COLUMNS, inplace=True)
+        # Strip spaces and convert key columns to numeric.
+        for col in ['completion_percentage', 'AGE', 'gender', 'public']:
+            chunk[col] = chunk[col].astype(str).str.strip()
+            chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
+        # Drop rows with missing values in key columns.
+        before_drop = chunk.shape[0]
+        chunk.dropna(subset=['completion_percentage', 'AGE', 'gender', 'public'], inplace=True)
+        after_drop = chunk.shape[0]
+        print(f"Rows before drop: {before_drop}, after drop: {after_drop}")  # Debug print
+        # Filter out rows where AGE is 0 (assuming 0 means not set).
+        chunk = chunk[chunk['AGE'] > 0]
+        print(f"Final chunk shape after AGE filter: {chunk.shape}")  # Debug print
+        yield chunk
+
+def train_incremental_linear_model(hdfs_path, chunksize=100000):
+    """
+    Trains a linear model incrementally using SGDRegressor.
+    """
+    sgd_model = SGDRegressor(max_iter=1000, tol=1e-3, random_state=42)
+    first_chunk = True
+    total_samples = 0
+    for chunk in read_data_from_hdfs_chunks(hdfs_path, chunksize):
+        if chunk.empty:
+            continue
+        X_chunk = chunk[['AGE', 'gender', 'public']]
+        y_chunk = chunk['completion_percentage']
+        total_samples += len(X_chunk)
+        if first_chunk:
+            sgd_model.partial_fit(X_chunk, y_chunk)
+            first_chunk = False
+        else:
+            sgd_model.partial_fit(X_chunk, y_chunk)
+    print(f"Total samples used for incremental linear model: {total_samples}")
+    return sgd_model
+
+def train_random_forest_from_sample(hdfs_path, chunksize=100000, sample_per_chunk=10000):
+    """
+    Trains a Random Forest model using a fixed sample from each chunk.
+    """
+    sample_list = []
+    total_samples = 0
+    for chunk in read_data_from_hdfs_chunks(hdfs_path, chunksize):
+        if chunk.empty:
+            continue
+        sample_size = min(sample_per_chunk, len(chunk))
+        sample_chunk = chunk.sample(n=sample_size, random_state=42)
+        sample_list.append(sample_chunk)
+        total_samples += len(sample_chunk)
+    if sample_list:
+        df_sample = pd.concat(sample_list)
+        X_sample = df_sample[['AGE', 'gender', 'public']]
+        y_sample = df_sample['completion_percentage']
+        rf_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+        rf_model.fit(X_sample, y_sample)
+        print(f"Total samples used for Random Forest: {total_samples}")
+        return rf_model, df_sample
+    else:
+        print("No data available for Random Forest training.")
+        return None, None
+
+def evaluate_model(model, X, y, model_name="Model"):
+    """
+    Evaluates the given model and prints the Mean Squared Error and R^2 score.
+    """
+    predictions = model.predict(X)
+    mse = mean_squared_error(y, predictions)
+    r2 = r2_score(y, predictions)
+    print(f"{model_name} Evaluation:")
+    print(f"  Mean Squared Error: {mse:.2f}")
+    print(f"  R^2 Score: {r2:.2f}")
+    print("-" * 40)
+    return mse, r2
+
+def main():
+    # Drain any input from STDIN (for Hadoop Streaming jobs).
+    drain_stdin()
+    
+    parser = argparse.ArgumentParser(
+        description="Pokec Classifier using Incremental Linear Model (SGDRegressor) and Random Forest (sample-based)."
+    )
+    parser.add_argument("--input", type=str, required=True,
+                        help="HDFS input file path for soc-pokec-profiles.txt")
+    args = parser.parse_args()
+    
+    print("Training incremental linear model using SGDRegressor (processing in chunks)...")
+    sgd_model = train_incremental_linear_model(args.input, chunksize=100000)
+    
+    print("Collecting an evaluation sample from a single chunk...")
+    eval_chunk = None
+    for chunk in read_data_from_hdfs_chunks(args.input, chunksize=100000):
+        if not chunk.empty:
+            eval_chunk = chunk
+            break
+    if eval_chunk is not None and not eval_chunk.empty:
+        X_eval = eval_chunk[['AGE', 'gender', 'public']]
+        y_eval = eval_chunk['completion_percentage']
+        print("Evaluating Incremental Linear Model on evaluation sample:")
+        evaluate_model(sgd_model, X_eval, y_eval, model_name="Incremental Linear Model")
+    else:
+        print("No evaluation data available.")
+    
+    print("Training Random Forest on sampled data (from each chunk)...")
+    rf_model, rf_sample = train_random_forest_from_sample(args.input, chunksize=100000, sample_per_chunk=10000)
+    if rf_model is not None and rf_sample is not None:
+        X_sample = rf_sample[['AGE', 'gender', 'public']]
+        y_sample = rf_sample['completion_percentage']
+        print("Evaluating Random Forest on sampled data:")
+        evaluate_model(rf_model, X_sample, y_sample, model_name="Random Forest")
+    else:
+        print("Random Forest training did not complete due to lack of data.")
+
+if __name__ == "__main__":
+    main()
